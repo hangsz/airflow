@@ -21,7 +21,6 @@ on:  # yamllint disable-line rule:truthy
   schedule:
     - cron: '28 0 * * *'
   push:
-    branches: ['main', 'v[0-9]+-[0-9]+-test']
   pull_request:
     branches: ['main', 'v[0-9]+-[0-9]+-test', 'v[0-9]+-[0-9]+-stable']
 permissions:
@@ -127,6 +126,10 @@ jobs:
     env:
       GITHUB_CONTEXT: ${{ toJson(github) }}
     outputs:
+      targetBranch: ${{ steps.dynamic-outputs.outputs.targetBranch }}
+      defaultBranch: ${{ steps.selective-checks.outputs.default-branch }}
+      waitForImage: ${{ steps.wait-for-image.outputs.wait-for-image }}
+      allPythonVersions: ${{ steps.selective-checks.outputs.all-python-versions }}
       upgradeToNewerDependencies: ${{ steps.selective-checks.outputs.upgrade-to-newer-dependencies }}
       pythonVersions: ${{ steps.selective-checks.outputs.python-versions }}
       pythonVersionsListAsString: ${{ steps.selective-checks.outputs.python-versions-list-as-string }}
@@ -222,6 +225,157 @@ jobs:
           github.ref == 'refs/heads/main' && github.repository == 'apache/airflow' &&
           github.event_name == 'push' &&
           steps.selective-checks.outputs.default-branch == 'main'
+
+  build-ci-images:
+    permissions:
+      packages: write
+    timeout-minutes: 80
+    name: "Build CI image ${{matrix.python-version}}"
+    runs-on: ${{ fromJson(needs.build-info.outputs.runsOn) }}
+    needs: [build-info]
+    strategy:
+      matrix:
+        python-version: ${{ fromJson(needs.build-info.outputs.allPythonVersions) }}
+      fail-fast: true
+    env:
+      RUNS_ON: ${{ fromJson(needs.build-info.outputs.runsOn)[0] }}
+      BACKEND: sqlite
+      PYTHON_MAJOR_MINOR_VERSION: ${{ matrix.python-version }}
+      UPGRADE_TO_NEWER_DEPENDENCIES: ${{ needs.build-info.outputs.upgradeToNewerDependencies }}
+      DOCKER_CACHE: ${{ needs.build-info.outputs.cacheDirective }}
+      GITHUB_REGISTRY_PULL_IMAGE_TAG: "latest"
+      GITHUB_REGISTRY_WAIT_FOR_IMAGE: "false"
+      outputs: ${{toJSON(needs.build-info.outputs) }}
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          ref: ${{ needs.build-info.outputs.targetCommitSha }}
+          persist-credentials: false
+          submodules: recursive
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - run: python -m pip install --editable ./dev/breeze/
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - name: "Retrieve DEFAULTS from the _initialization.sh"
+        # We cannot "source" the script here because that would be a security problem (we cannot run
+        # any code that comes from the sources coming from the PR. Therefore we extract the
+        # DEFAULT_BRANCH and DEFAULT_CONSTRAINTS_BRANCH and DEBIAN_VERSION via custom grep/awk/sed commands
+        id: defaults
+        run: |
+          DEFAULT_BRANCH=$(grep "export DEFAULT_BRANCH" scripts/ci/libraries/_initialization.sh | \
+            awk 'BEGIN{FS="="} {print $3}' | sed s'/["}]//g')
+          echo "DEFAULT_BRANCH=${DEFAULT_BRANCH}" >> $GITHUB_ENV
+          DEFAULT_CONSTRAINTS_BRANCH=$(grep "export DEFAULT_CONSTRAINTS_BRANCH" \
+            scripts/ci/libraries/_initialization.sh | \
+            awk 'BEGIN{FS="="} {print $3}' | sed s'/["}]//g')
+          echo "DEFAULT_CONSTRAINTS_BRANCH=${DEFAULT_CONSTRAINTS_BRANCH}" >> $GITHUB_ENV
+          DEBIAN_VERSION=$(grep "export DEBIAN_VERSION" scripts/ci/libraries/_initialization.sh | \
+            awk 'BEGIN{FS="="} {print $3}' | sed s'/["}]//g')
+          echo "DEBIAN_VERSION=${DEBIAN_VERSION}" >> $GITHUB_ENV
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - name: >
+          Checkout "${{ needs.build-info.outputs.targetBranch }}" branch to 'main-airflow' folder
+          to use ci/scripts from there.
+        uses: actions/checkout@v2
+        with:
+          path: "main-airflow"
+          ref: "${{ needs.build-info.outputs.targetBranch }}"
+          persist-credentials: false
+          submodules: recursive
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - name: "Setup python"
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ needs.build-info.outputs.defaultPythonVersion }}
+      - name: "Free space"
+        run: airflow-freespace
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - name: "Build CI image ${{ matrix.python-version }}:${{ env.GITHUB_REGISTRY_PUSH_IMAGE_TAG }}"
+        run: Breeze2 build-ci-image
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - name: "Push CI image ${{ matrix.python-version }}:${{ env.GITHUB_REGISTRY_PUSH_IMAGE_TAG }}"
+        run: ./scripts/ci/images/ci_push_ci_images.sh
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - name: "Candidates for pip resolver backtrack triggers: ${{ matrix.python-version }}"
+        if: failure() || cancelled()
+        run: airflow-find-newer-dependencies --max-age 1 --python "${{ matrix.python-version }}"
+
+  build-prod-images:
+    permissions:
+      packages: write
+    timeout-minutes: 80
+    name: "Build PROD image ${{matrix.python-version}}"
+    runs-on: ${{ fromJson(needs.build-info.outputs.runsOn) }}
+    needs: [build-info, build-ci-images]
+    strategy:
+      matrix:
+        python-version: ${{ fromJson(needs.build-info.outputs.allPythonVersions) }}
+      fail-fast: true
+    env:
+      RUNS_ON: ${{ fromJson(needs.build-info.outputs.runsOn)[0] }}
+      BACKEND: sqlite
+      PYTHON_MAJOR_MINOR_VERSION: ${{ matrix.python-version }}
+      UPGRADE_TO_NEWER_DEPENDENCIES: ${{ needs.build-info.outputs.upgradeToNewerDependencies }}
+      DOCKER_CACHE: ${{ needs.build-info.outputs.cacheDirective }}
+      VERSION_SUFFIX_FOR_PYPI: ".dev0"
+      GITHUB_REGISTRY_PULL_IMAGE_TAG: "latest"
+      GITHUB_REGISTRY_WAIT_FOR_IMAGE: "false"
+      INSTALL_PROVIDERS_FROM_SOURCES: >
+        ${{ needs.build-info.outputs.defaultBranch == 'main' && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          ref: ${{ needs.build-info.outputs.targetCommitSha }}
+          persist-credentials: false
+          submodules: recursive
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - name: "Retrieve DEFAULTS from the _initialization.sh"
+        # We cannot "source" the script here because that would be a security problem (we cannot run
+        # any code that comes from the sources coming from the PR. Therefore we extract the
+        # DEFAULT_BRANCH and DEFAULT_CONSTRAINTS_BRANCH and DEBIAN_VERSION via custom grep/awk/sed commands
+        id: defaults
+        run: |
+          DEFAULT_BRANCH=$(grep "export DEFAULT_BRANCH" scripts/ci/libraries/_initialization.sh | \
+            awk 'BEGIN{FS="="} {print $3}' | sed s'/["}]//g')
+          echo "DEFAULT_BRANCH=${DEFAULT_BRANCH}" >> $GITHUB_ENV
+          DEFAULT_CONSTRAINTS_BRANCH=$(grep "export DEFAULT_CONSTRAINTS_BRANCH" \
+            scripts/ci/libraries/_initialization.sh | \
+            awk 'BEGIN{FS="="} {print $3}' | sed s'/["}]//g')
+          echo "DEFAULT_CONSTRAINTS_BRANCH=${DEFAULT_CONSTRAINTS_BRANCH}" >> $GITHUB_ENV
+          DEBIAN_VERSION=$(grep "export DEBIAN_VERSION" scripts/ci/libraries/_initialization.sh | \
+            cut -d "=" -f 3 | sed s'/["}]//g')
+          echo "DEBIAN_VERSION=${DEBIAN_VERSION}" >> $GITHUB_ENV
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - name: >
+          Checkout "${{ needs.build-info.outputs.targetBranch }}" branch to 'main-airflow' folder
+          to use ci/scripts from there.
+        uses: actions/checkout@v2
+        with:
+          path: "main-airflow"
+          ref: "${{ needs.build-info.outputs.targetBranch }}"
+          persist-credentials: false
+          submodules: recursive
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - name: "Setup python"
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ needs.build-info.outputs.defaultPythonVersion }}
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - run: python -m pip install --editable ./dev/breeze/
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - name: "Free space"
+        run: airflow-freespace
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - name: "Pull CI image for PROD ${{ matrix.python-version }}:${{ env.GITHUB_REGISTRY_PUSH_IMAGE_TAG }}"
+        run: ./scripts/ci/images/ci_pull_ci_image_on_ci.sh
+        env:
+          GITHUB_REGISTRY_PULL_IMAGE_TAG: ${{ github.event.pull_request.head.sha || github.sha }}
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - name: "Build PROD image ${{ matrix.python-version }}:${{ env.GITHUB_REGISTRY_PUSH_IMAGE_TAG }}"
+        run: ./scripts/ci/images/ci_build_prod_image_on_ci.sh
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
+      - name: "Push PROD image ${{ matrix.python-version }}:${{ env.GITHUB_REGISTRY_PUSH_IMAGE_TAG }}"
+        run: ./scripts/ci/images/ci_push_production_images.sh
+        if: github.event_name  == 'pull_request' || github.event_name  == 'schedule'
 
   run-new-breeze-tests:
     timeout-minutes: 10
@@ -367,7 +521,7 @@ jobs:
     timeout-minutes: 120
     name: "Wait for CI images"
     runs-on: ${{ fromJson(needs.build-info.outputs.runsOn) }}
-    needs: [build-info]
+    needs: [build-info, build-ci-images]
     if: needs.build-info.outputs.image-build == 'true'
     env:
       RUNS_ON: ${{ fromJson(needs.build-info.outputs.runsOn) }}
@@ -1102,7 +1256,7 @@ ${{ hashFiles('.pre-commit-config.yaml') }}"
     timeout-minutes: 120
     name: "Wait for PROD images"
     runs-on: ${{ fromJson(needs.build-info.outputs.runsOn) }}
-    needs: [build-info, ci-images]
+    needs: [build-info, ci-images, build-prod-images]
     if: needs.build-info.outputs.image-build == 'true'
     env:
       RUNS_ON: ${{ fromJson(needs.build-info.outputs.runsOn) }}
